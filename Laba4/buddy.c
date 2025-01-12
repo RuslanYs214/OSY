@@ -1,154 +1,168 @@
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <string.h>
+#include <sys/mman.h>
 
-typedef struct Block {
+#define NUM_LISTS 32
+
+typedef struct BlockHeader {
     size_t size;
-    int free;
-    struct Block *left;
-    struct Block *right;
-} Block;
+    struct BlockHeader* next;
+    struct BlockHeader* prev;
+    int is_free;
+} BlockHeader;
 
 typedef struct Allocator {
-    Block *root;
-    void *memory;
-    size_t total_size;
-    size_t offset;
+    void* memory;
+    size_t size;
+    BlockHeader* free_lists[NUM_LISTS];
 } Allocator;
 
-int is_power_of_two(unsigned int n) {
-    return (n > 0) && ((n & (n - 1)) == 0);
-}
-
-void write_error(const char *msg) {
-    write(STDERR_FILENO, msg, strlen(msg));
-}
-
-size_t largest_power_of_two(size_t n) {
-    size_t power = 1;
-    while (power << 1 <= n) {
-        power <<= 1;
-    }
-    return power;
-}
-
-Block *create_node(Allocator *allocator, size_t size) {
-    if (allocator->offset + sizeof(Block) > allocator->total_size) {
-        write_error("ERROR: Not enough memory to create a new block\n");
-        return NULL;
-    }
-
-    Block *node = (Block *)((char *)allocator->memory + allocator->offset);
-    allocator->offset += sizeof(Block);
-    node->size = size;
-    node->free = 1;
-    node->left = node->right = NULL;
-    return node;
-}
-
-void* allocator_create(void *mem, size_t size) {
-    if (!is_power_of_two(size)) {
-        write_error("ERROR: Allocator initializes memory of size not power of two\n");
-        return NULL;
-    }
-
-    Allocator *allocator = (Allocator *)mem;
-    allocator->memory = (char *)mem + sizeof(Allocator);
-    allocator->total_size = size - sizeof(Allocator);
-    allocator->offset = 0;
-
-    size_t root_size = largest_power_of_two(allocator->total_size);
-    allocator->root = create_node(allocator, root_size);
-    if (!allocator->root) {
-        write_error("ERROR: Unable to create root block\n");
-        return NULL;
-    }
-
-    return (void *)allocator;
-}
-
-void split_node(Allocator *allocator, Block *node) {
-    size_t newSize = node->size / 2;
-
-    node->left = create_node(allocator, newSize);
-    node->right = create_node(allocator, newSize);
-}
-
-Block *allocate_block(Allocator *allocator, Block *node, size_t size) {
-    if (node == NULL || node->size < size || !node->free) {
-        return NULL;
-    }
-
-    if (node->size == size) {
-        node->free = 0;
-        return node;
-    }
-
-    if (node->left == NULL) {
-        split_node(allocator, node);
-        if (node->left == NULL || node->right == NULL) {
-            return NULL;
+static int get_free_list_index(size_t size) {
+    int index = 0;
+    size_t current_size = 1;
+    while (current_size < size) {
+        current_size <<= 1;
+        index++;
+        if (index >= NUM_LISTS - 1) {
+            return NUM_LISTS - 1;
         }
     }
-
-    Block *allocated = allocate_block(allocator, node->left, size);
-    if (allocated == NULL) {
-        allocated = allocate_block(allocator, node->right, size);
-    }
-
-    node->free = (node->left && node->left->free) && (node->right && node->right->free);
-    return allocated;
+    return index;
 }
 
-void* my_malloc(void *allocator_ptr, size_t size) {
-    if (allocator_ptr == NULL || size == 0) {
+static void add_to_free_list(Allocator* allocator, BlockHeader* block) {
+    int index = get_free_list_index(block->size);
+    block->is_free = 1;
+    block->next = allocator->free_lists[index];
+    block->prev = NULL;
+    if (allocator->free_lists[index] != NULL) {
+        allocator->free_lists[index]->prev = block;
+    }
+    allocator->free_lists[index] = block;
+}
+
+static void remove_from_free_list(Allocator* allocator, BlockHeader* block) {
+    int index = get_free_list_index(block->size);
+    if (block->prev != NULL) {
+        block->prev->next = block->next;
+    } else {
+        allocator->free_lists[index] = block->next;
+    }
+    if (block->next != NULL) {
+        block->next->prev = block->prev;
+    }
+    block->next = block->prev = NULL;
+    block->is_free = 0;
+}
+
+static BlockHeader* split_block(BlockHeader* block, size_t size) {
+    size_t new_size = block->size / 2;
+    BlockHeader* buddy = (BlockHeader*)((char*)block + new_size);
+    buddy->size = new_size;
+    buddy->next = NULL;
+    buddy->prev = NULL;
+    buddy->is_free = 1;
+    block->size = new_size;
+    return buddy;
+}
+
+static void merge_blocks(Allocator* allocator, BlockHeader* block) {
+    size_t block_addr = (size_t)block;
+    size_t memory_addr = (size_t)allocator->memory;
+    size_t block_offset = block_addr - memory_addr;
+    size_t buddy_offset = block_offset ^ block->size;
+    BlockHeader* buddy = (BlockHeader*)(memory_addr + buddy_offset);
+    if (buddy != NULL && buddy->is_free && buddy->size == block->size) {
+        remove_from_free_list(allocator, buddy);
+        if (block < buddy) {
+            block->size *= 2;
+        } else {
+            buddy->size *= 2;
+            block = buddy;
+        }
+        merge_blocks(allocator, block);
+    } else {
+        add_to_free_list(allocator, block);
+    }
+}
+
+void* allocator_create(void* mem, size_t size) {
+    if (mem == NULL || size <= sizeof(Allocator) + sizeof(BlockHeader)) {
+        write(STDERR_FILENO, "Error: Insufficient memory for allocator initialization.\n", 58);
+        return NULL;
+    }
+    
+    if ((size & (size - 1)) != 0) {
+        write(STDERR_FILENO, "Error: Memory size must be a power of two.\n", 43);
         return NULL;
     }
 
-    Allocator *allocator = (Allocator *)allocator_ptr;
+    Allocator* allocator = (Allocator*)mem;
+    allocator->memory = (char*)mem + sizeof(Allocator);
+    allocator->size = size - sizeof(Allocator);
 
-    size_t power_size = 1;
-    while (power_size < size) {
-        power_size <<= 1;
+    for (int i = 0; i < NUM_LISTS; i++) {
+        allocator->free_lists[i] = NULL;
     }
 
-    Block *allocated_block = allocate_block(allocator, allocator->root, power_size);
-    if (allocated_block == NULL) {
-        return NULL;
-    }
+    BlockHeader* initial_block = (BlockHeader*)allocator->memory;
+    initial_block->size = allocator->size;
+    initial_block->next = NULL;
+    initial_block->prev = NULL;
+    initial_block->is_free = 1;
 
-    return (void *)((char *)allocated_block + sizeof(Block));
+    add_to_free_list(allocator, initial_block);
+    return allocator;
 }
 
-void my_free(void *allocator_ptr, void *ptr) {
-    if (allocator_ptr == NULL || ptr == NULL) {
+
+void* my_malloc(void* allocator_ptr, size_t size) {
+    if (size == 0 || allocator_ptr == NULL) {
+        return NULL;
+    }
+    Allocator* allocator = (Allocator*)allocator_ptr;
+    size += sizeof(BlockHeader);
+    int index = get_free_list_index(size);
+    for (int i = index; i < NUM_LISTS; i++) {
+        BlockHeader* block = allocator->free_lists[i];
+        if (block == NULL) continue;
+        while (block != NULL) {
+            remove_from_free_list(allocator, block);
+            while (block->size > size) {
+                BlockHeader* buddy = split_block(block, size);
+                add_to_free_list(allocator, buddy);
+            }
+            block->is_free = 0;
+            return (char*)block + sizeof(BlockHeader);
+        }
+    }
+    return NULL;
+}
+
+void my_free(void* allocator_ptr, void* ptr) {
+    if (ptr == NULL || allocator_ptr == NULL) {
         return;
     }
-
-    Allocator *allocator = (Allocator *)allocator_ptr;
-
-    Block *node = (Block *)((char *)ptr - sizeof(Block));
-    node->free = 1;
-
-    while (node->left != NULL && node->left->free && node->right->free) {
-        node->left = node->right = NULL;
-        node->size *= 2;
-
-        break;
+    Allocator* allocator = (Allocator*)allocator_ptr;
+    BlockHeader* block = (BlockHeader*)((char*)ptr - sizeof(BlockHeader));
+    if (block < (BlockHeader*)allocator->memory || 
+        (char*)block > (char*)allocator->memory + allocator->size) {
+        write(STDERR_FILENO, "Error: Invalid free request.\n", 29);
+        return;
     }
+    block->is_free = 1;
+    merge_blocks(allocator, block);
 }
 
-void allocator_destroy(void *allocator_ptr, size_t size) {
+void allocator_destroy(void* allocator_ptr, size_t size) {
     if (!allocator_ptr) {
         return;
     }
-
-    Allocator *allocator = (Allocator *)allocator_ptr;
-    void *full_memory = (char *)allocator->memory - sizeof(Allocator);
-
+    Allocator* allocator = (Allocator*)allocator_ptr;
+    void* full_memory = (char*)allocator->memory - sizeof(Allocator);
     if (munmap(full_memory, size) == -1) {
-        const char msg[] = "ERROR: munmap failed\n";
+        const char msg[] = "Error: munmap failed.\n";
         write(STDERR_FILENO, msg, sizeof(msg) - 1);
         _exit(EXIT_FAILURE);
     }
